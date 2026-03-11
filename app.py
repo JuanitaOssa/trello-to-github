@@ -705,8 +705,8 @@ def init_session_state():
         "status_mapping": {},  # Trello list ID -> mapping info
         "mapping_complete": False,
         "options_to_create": [],  # Status options that need to be created
-        "project_mode": "existing",  # "existing" or "create_new"
         "new_project_name": "",  # Name for new project if creating
+        # Note: "project_mode" is controlled by widget, not initialized here
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -1172,7 +1172,6 @@ def render_status_mapping_step(
                 options_to_create.append(cleaned_name)
 
         st.session_state.options_to_create = options_to_create
-        st.session_state.project_mode = "create_new"
         st.session_state.new_project_name = project_name
 
         st.divider()
@@ -1232,7 +1231,6 @@ def render_status_mapping_step(
     if not project or not status_field:
         return False
 
-    st.session_state.project_mode = "existing"
     st.success(f"Connected to project: **{project['title']}**")
 
     # Get available status options
@@ -1707,8 +1705,10 @@ def render_results():
         st.session_state.status_mapping = {}
         st.session_state.mapping_complete = False
         st.session_state.options_to_create = []
-        st.session_state.project_mode = "existing"
         st.session_state.new_project_name = ""
+        # Reset widget-controlled keys by deleting them (widget will reinitialize)
+        for key in ["project_mode", "github_project_number", "github_project_name"]:
+            st.session_state.pop(key, None)
         st.rerun()
 
 
