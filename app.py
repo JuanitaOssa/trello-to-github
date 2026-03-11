@@ -557,6 +557,92 @@ class GitHubClient:
         issue = result.get("repository", {}).get("issue")
         return issue.get("id") if issue else None
 
+    def get_owner_node_id(self) -> Optional[str]:
+        """
+        Get the GraphQL node ID for the owner (user or org).
+
+        Required for creating new projects.
+        """
+        if self.is_org:
+            result = self._make_request("GET", f"/orgs/{self.owner}")
+        else:
+            result = self._make_request("GET", f"/users/{self.owner}")
+
+        if result:
+            return result.get("node_id")
+        return None
+
+    def create_project_v2(self, title: str) -> Optional[dict]:
+        """
+        Create a new GitHub Project v2.
+
+        Returns project info including id, number, and url.
+        """
+        owner_node_id = self.get_owner_node_id()
+        if not owner_node_id:
+            return None
+
+        mutation = """
+        mutation CreateProject($ownerId: ID!, $title: String!) {
+            createProjectV2(input: {
+                ownerId: $ownerId
+                title: $title
+            }) {
+                projectV2 {
+                    id
+                    number
+                    url
+                    title
+                }
+            }
+        }
+        """
+        variables = {
+            "ownerId": owner_node_id,
+            "title": title
+        }
+
+        result = self._graphql_request(mutation, variables)
+        return result.get("createProjectV2", {}).get("projectV2")
+
+    def link_repo_to_project(self, project_id: str, repo_name: str) -> bool:
+        """
+        Link a repository to a GitHub Project v2.
+
+        This adds the repository to the project's linked repositories.
+        """
+        # First get the repo node ID
+        query = """
+        query($owner: String!, $repo: String!) {
+            repository(owner: $owner, name: $repo) {
+                id
+            }
+        }
+        """
+        variables = {"owner": self.owner, "repo": repo_name}
+        result = self._graphql_request(query, variables)
+        repo_id = result.get("repository", {}).get("id")
+
+        if not repo_id:
+            return False
+
+        # Link the repo to the project
+        mutation = """
+        mutation LinkRepo($projectId: ID!, $repositoryId: ID!) {
+            linkProjectV2ToRepository(input: {
+                projectId: $projectId
+                repositoryId: $repositoryId
+            }) {
+                repository {
+                    id
+                }
+            }
+        }
+        """
+        variables = {"projectId": project_id, "repositoryId": repo_id}
+        result = self._graphql_request(mutation, variables)
+        return result.get("linkProjectV2ToRepository", {}).get("repository") is not None
+
     def get_labels(self, repo_name: str) -> list[dict]:
         """Get all labels in a repository."""
         result = self._make_request(
@@ -619,6 +705,8 @@ def init_session_state():
         "status_mapping": {},  # Trello list ID -> mapping info
         "mapping_complete": False,
         "options_to_create": [],  # Status options that need to be created
+        "project_mode": "existing",  # "existing" or "create_new"
+        "new_project_name": "",  # Name for new project if creating
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -746,16 +834,66 @@ def render_sidebar() -> dict:
             help="Target repository name (will be created if it doesn't exist)"
         )
 
-        github_project_number = st.text_input(
-            "Project Number",
-            key="github_project_number",
-            help="The number from your project URL (e.g., 18 from /projects/18)"
+        # Project setup toggle
+        st.write("**GitHub Project**")
+        project_mode = st.radio(
+            "Project Setup",
+            options=["existing", "create_new"],
+            format_func=lambda x: "Use existing project" if x == "existing" else "Create new project",
+            key="project_mode",
+            horizontal=True,
+            label_visibility="collapsed"
         )
+
+        github_project_number = ""
+        github_project_name = ""
+
+        if project_mode == "existing":
+            github_project_number = st.text_input(
+                "Project Number",
+                key="github_project_number",
+                help="The number from your project URL (e.g., 18 from /projects/18)"
+            )
+
+            # Guidance for existing project
+            with st.expander("Need help finding your project?"):
+                owner_placeholder = github_owner if github_owner else "YOUR_ORG"
+                if is_org:
+                    create_url = f"github.com/orgs/{owner_placeholder}/projects/new"
+                    example_url = f"github.com/orgs/{owner_placeholder}/projects/18"
+                else:
+                    create_url = f"github.com/users/{owner_placeholder}/projects/new"
+                    example_url = f"github.com/users/{owner_placeholder}/projects/18"
+
+                st.markdown(f"""
+**Don't have a project yet?** Create one at:
+`{create_url}`
+
+**To find your project number:**
+Go to your GitHub Project board. The number is at the end of the URL:
+`{example_url}` ← this is **18**
+
+**Token permissions required:**
+GitHub Settings → Developer Settings → Personal Access Tokens → Edit
+Check: `read:project` and `project`
+                """)
+        else:
+            github_project_name = st.text_input(
+                "New Project Name",
+                key="github_project_name",
+                help="Name for the new GitHub Project to create"
+            )
+            st.info("A new GitHub Project will be created and linked to your repository during migration.")
 
         st.divider()
 
         # Validation status
-        github_ready = all([github_token, github_owner, github_repo, github_project_number])
+        if project_mode == "existing":
+            project_ready = bool(github_project_number)
+        else:
+            project_ready = bool(github_project_name)
+
+        github_ready = all([github_token, github_owner, github_repo]) and project_ready
 
         if input_mode == "api":
             trello_ready = all([trello_api_key, trello_token])
@@ -781,6 +919,8 @@ def render_sidebar() -> dict:
             "github_owner": github_owner,
             "github_repo": github_repo,
             "github_project_number": github_project_number,
+            "github_project_name": github_project_name,
+            "github_project_mode": project_mode,
             "github_is_org": is_org,
             "trello_ready": trello_ready,
             "github_ready": github_ready,
@@ -978,7 +1118,12 @@ def render_board_preview(board_data: dict):
                 st.caption("No cards in this list")
 
 
-def render_status_mapping_step(github_client: GitHubClient, project_number: str):
+def render_status_mapping_step(
+    github_client: GitHubClient,
+    project_number: str,
+    project_mode: str = "existing",
+    project_name: str = ""
+):
     """Render the status field mapping step."""
     st.header("Step 2: Map Lists to Project Status")
 
@@ -986,12 +1131,66 @@ def render_status_mapping_step(github_client: GitHubClient, project_number: str)
         st.info("Please load a Trello board first.")
         return False
 
+    board_data = st.session_state.board_data
+    lists = board_data["lists"]
+
+    # Handle "create new project" mode
+    if project_mode == "create_new":
+        if not project_name:
+            st.warning("Please enter a name for the new GitHub Project in the sidebar.")
+            return False
+
+        st.info(f"A new project **\"{project_name}\"** will be created during migration.")
+        st.write("All Trello lists will become Status options in the new project.")
+
+        # Build automatic mapping (all lists become new status options)
+        mapping = {}
+        options_to_create = []
+
+        st.divider()
+        st.write("**Status Mapping Preview:**")
+
+        for lst in lists:
+            list_name = lst["name"]
+            cleaned_name = clean_title(list_name)
+
+            col1, col2, col3 = st.columns([2, 2, 1])
+
+            with col1:
+                st.write(f"**{list_name}**")
+            with col2:
+                st.write(f"→ {cleaned_name}")
+            with col3:
+                st.warning("Will create", icon="➕")
+
+            mapping[lst["id"]] = {
+                "status_name": cleaned_name,
+                "status_option_id": None,
+                "needs_creation": True
+            }
+            if cleaned_name not in options_to_create:
+                options_to_create.append(cleaned_name)
+
+        st.session_state.options_to_create = options_to_create
+        st.session_state.project_mode = "create_new"
+        st.session_state.new_project_name = project_name
+
+        st.divider()
+
+        if st.button("Confirm Mapping", type="primary"):
+            st.session_state.status_mapping = mapping
+            st.session_state.mapping_complete = True
+            st.rerun()
+
+        if st.session_state.mapping_complete:
+            st.success("Mapping confirmed. Ready to migrate.")
+
+        return st.session_state.mapping_complete
+
+    # Handle "existing project" mode
     if not project_number:
         st.warning("Please enter a GitHub Project Number in the sidebar.")
         return False
-
-    board_data = st.session_state.board_data
-    lists = board_data["lists"]
 
     # Fetch project data if not already loaded
     if not st.session_state.project_data:
@@ -1033,6 +1232,7 @@ def render_status_mapping_step(github_client: GitHubClient, project_number: str)
     if not project or not status_field:
         return False
 
+    st.session_state.project_mode = "existing"
     st.success(f"Connected to project: **{project['title']}**")
 
     # Get available status options
@@ -1135,6 +1335,8 @@ def render_migrate_step(
 
     board_data = st.session_state.board_data
     project = st.session_state.project_data
+    project_mode = st.session_state.get("project_mode", "existing")
+    new_project_name = st.session_state.get("new_project_name", "")
 
     st.write(
         f"Ready to migrate **{board_data['board_name']}** to "
@@ -1147,8 +1349,12 @@ def render_migrate_step(
     with st.container(border=True):
         st.write("**Migration plan:**")
         st.write(f"- Create repository `{repo_name}` (if it doesn't exist)")
+        if project_mode == "create_new":
+            st.write(f"- Create new GitHub Project: **{new_project_name}**")
+            st.write(f"- Link repository to project")
+        else:
+            st.write(f"- Add issues to project: **{project['title']}**")
         st.write(f"- Create {len(board_data['cards'])} issues")
-        st.write(f"- Add issues to project: **{project['title']}**")
         st.write(f"- Set status for {mapped_count} list mappings")
 
     col1, col2 = st.columns([1, 3])
@@ -1174,9 +1380,13 @@ def run_migration(
     status_field = st.session_state.status_field
     status_mapping = st.session_state.status_mapping.copy()  # Make a copy to modify
     options_to_create = st.session_state.get("options_to_create", [])
+    project_mode = st.session_state.get("project_mode", "existing")
+    new_project_name = st.session_state.get("new_project_name", "")
 
     results = {
         "repo_created": False,
+        "project_created": False,
+        "project_url": None,
         "status_options_created": 0,
         "labels_created": 0,
         "issues_created": 0,
@@ -1188,8 +1398,9 @@ def run_migration(
 
     cards = board_data["cards"]
 
-    # Total steps: repo + status options + labels + (issue creation + add to project + set status) per card
-    total_steps = 1 + 1 + 1 + (len(cards) * 3)
+    # Total steps: repo + project (if creating) + status options + labels + (issue creation + add to project + set status) per card
+    project_steps = 1 if project_mode == "create_new" else 0
+    total_steps = 1 + project_steps + 1 + 1 + (len(cards) * 3)
     current_step = 0
 
     progress_bar = st.progress(0)
@@ -1211,6 +1422,54 @@ def run_migration(
 
         current_step += 1
         progress_bar.progress(current_step / total_steps)
+
+        # Step 1.5: Create new project if needed
+        if project_mode == "create_new":
+            status_text.write(f"Creating GitHub Project: {new_project_name}...")
+
+            try:
+                project = github_client.create_project_v2(new_project_name)
+
+                if project:
+                    results["project_created"] = True
+                    results["project_url"] = project.get("url")
+                    st.session_state.project_data = project
+
+                    status_text.write(f"Created project: {project['title']}")
+
+                    # Link repo to project
+                    status_text.write("Linking repository to project...")
+                    github_client.link_repo_to_project(project["id"], repo_name)
+
+                    # Get the status field for the new project
+                    time.sleep(1)  # Brief pause for propagation
+                    status_field = github_client.get_project_status_field(project["id"])
+
+                    if status_field:
+                        st.session_state.status_field = status_field
+                    else:
+                        # Create a default status field response for new projects
+                        # New projects have a Status field by default
+                        error_msg = "Could not find Status field in new project"
+                        results["errors"].append(error_msg)
+                        with error_container:
+                            st.warning(error_msg)
+                else:
+                    error_msg = "Failed to create GitHub Project"
+                    results["errors"].append(error_msg)
+                    with error_container:
+                        st.error(error_msg)
+                    return
+
+            except Exception as e:
+                error_msg = f"Error creating project: {e}"
+                results["errors"].append(error_msg)
+                with error_container:
+                    st.error(error_msg)
+                return
+
+            current_step += 1
+            progress_bar.progress(current_step / total_steps)
 
         # Step 2: Create new Status options if needed
         if options_to_create:
@@ -1405,7 +1664,10 @@ def render_results():
     with col1:
         st.metric("Repository", "Created" if results["repo_created"] else "Existed")
     with col2:
-        st.metric("Status Options", results.get("status_options_created", 0))
+        if results.get("project_created"):
+            st.metric("Project", "Created")
+        else:
+            st.metric("Status Options", results.get("status_options_created", 0))
     with col3:
         st.metric("Issues", results["issues_created"])
     with col4:
@@ -1423,10 +1685,13 @@ def render_results():
     else:
         st.success("Migration completed successfully!")
 
-    # Repository link
+    # Links
     st.divider()
-    st.subheader("Your Repository")
-    st.markdown(f"[**Open {results['repo_url']}**]({results['repo_url']})")
+    st.subheader("Your Resources")
+    st.markdown(f"**Repository:** [{results['repo_url']}]({results['repo_url']})")
+
+    if results.get("project_url"):
+        st.markdown(f"**Project:** [{results['project_url']}]({results['project_url']})")
 
     # Reset button
     if st.button("Start New Migration"):
@@ -1442,6 +1707,8 @@ def render_results():
         st.session_state.status_mapping = {}
         st.session_state.mapping_complete = False
         st.session_state.options_to_create = []
+        st.session_state.project_mode = "existing"
+        st.session_state.new_project_name = ""
         st.rerun()
 
 
@@ -1523,6 +1790,8 @@ def main():
     )
     github_repo = sidebar_config["github_repo"]
     github_project_number = sidebar_config["github_project_number"]
+    github_project_name = sidebar_config["github_project_name"]
+    github_project_mode = sidebar_config["github_project_mode"]
 
     # Show results if migration is complete
     if st.session_state.migration_complete:
@@ -1544,7 +1813,12 @@ def main():
 
     # Step 2: Map Trello lists to GitHub Project Status
     if st.session_state.board_data:
-        render_status_mapping_step(github_client, github_project_number)
+        render_status_mapping_step(
+            github_client,
+            github_project_number,
+            github_project_mode,
+            github_project_name
+        )
 
         st.divider()
 
