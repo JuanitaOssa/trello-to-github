@@ -1092,9 +1092,9 @@ def render_status_mapping_step(github_client: GitHubClient, project_number: str)
 
         with col3:
             if cleaned_name in option_map:
-                st.success("Matched", icon="✓")
+                st.success("Matched", icon="✅")
             else:
-                st.warning("Will create", icon="✚")
+                st.warning("Will create", icon="➕")
 
     # Store options that need to be created
     st.session_state.options_to_create = options_to_create
