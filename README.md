@@ -9,11 +9,16 @@ A Streamlit web application that migrates Trello boards to GitHub Issues and Pro
   - **JSON Upload Mode**: Upload a Trello board export file (no API credentials needed)
 - **Board Preview**: View all lists and cards before migration with an expandable interface
 - **Status Mapping**: Map Trello lists to GitHub Project status fields with a visual interface
+- **Flexible Project Setup**:
+  - Use an existing GitHub Project, or
+  - Create a new GitHub Project automatically during migration
 - **Smart Migration**:
   - Creates GitHub repository automatically (if it doesn't exist)
+  - Creates GitHub Project v2 automatically (if selected)
   - Converts Trello cards → GitHub Issues
   - Adds issues to GitHub Projects v2
   - Sets Project status based on Trello list (via GraphQL API)
+  - Auto-creates missing Status options to match your Trello lists
   - Preserves and creates labels with matching colors
   - Links back to original Trello cards
 - **Real-time Progress**: Watch the migration happen with a live progress bar
@@ -34,7 +39,7 @@ A Streamlit web application that migrates Trello boards to GitHub Issues and Pro
 
 - Python 3.9 or higher
 - A Trello account with at least one board
-- A GitHub account with a Project (Projects v2)
+- A GitHub account (Project can be created automatically or use an existing one)
 
 ### Installation
 
@@ -116,10 +121,23 @@ Or use this direct link: [Generate token with required scopes](https://github.co
 
 ### GitHub Project Setup
 
+You have two options:
+
+#### Option A: Create a New Project (Recommended)
+
+Select "Create new project" in the app sidebar and enter a name. The app will:
+- Create a new GitHub Project v2 automatically
+- Link your repository to the project
+- Create Status options matching your Trello lists
+
+#### Option B: Use an Existing Project
+
 1. Create a GitHub Project (Projects v2) in your account or organization
 2. Add a **Status** field to the project (usually exists by default)
 3. Configure status options to match your Trello lists (e.g., "To Do", "In Progress", "Done")
 4. Note the **Project Number** from the URL (e.g., `18` from `github.com/users/you/projects/18`)
+
+> **Tip**: The app will auto-create any missing Status options that match your Trello list names.
 
 ## How It Works
 
@@ -196,14 +214,22 @@ Trello label colors are automatically mapped to GitHub label colors:
 2. Select account type (Personal or Organization)
 3. Enter your username/org name
 4. Enter the target repository name
-5. Enter the Project Number
+5. Choose your project setup:
+   - **Use existing project**: Enter the Project Number from your project URL
+   - **Create new project**: Enter a name for the new project
 
 ### Step 3: Map Status Fields
 
+**For existing projects:**
 1. The app fetches your GitHub Project's Status field options
-2. For each Trello list, select the corresponding GitHub Status
-3. Lists are auto-matched by name when possible
+2. Lists are auto-matched by name when possible
+3. Missing status options will be created automatically
 4. Click "Confirm Mapping" to proceed
+
+**For new projects:**
+1. All Trello lists are shown as status options to be created
+2. Review the mapping preview
+3. Click "Confirm Mapping" to proceed
 
 ### Step 4: Migrate
 
@@ -248,7 +274,6 @@ Then edit `.env` with your credentials. The app will still allow manual input fo
 - **Comments**: Trello card comments are not migrated
 - **Checklists**: Trello checklists are not migrated (consider using GitHub task lists in the future)
 - **Due Dates**: Trello due dates are not mapped
-- **Project Required**: You must have an existing GitHub Project with a Status field
 
 ## Contributing
 
