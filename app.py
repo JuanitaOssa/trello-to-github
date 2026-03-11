@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import streamlit as st
 import requests
-from typing import Optional, Union
+from typing import Optional, Union, List, Dict
 import time
 import json
 import re
@@ -152,7 +152,7 @@ class TrelloClient:
         self.api_key = api_key
         self.token = token
 
-    def _make_request(self, endpoint: str, params: Optional[dict] = None) -> dict | list:
+    def _make_request(self, endpoint: str, params: Optional[dict] = None) -> Union[dict, list]:
         """Make an authenticated request to the Trello API."""
         url = f"{self.BASE_URL}{endpoint}"
         params = params or {}
@@ -218,7 +218,7 @@ class GitHubClient:
         method: str,
         endpoint: str,
         data: Optional[dict] = None
-    ) -> dict | list | None:
+    ) -> Optional[Union[dict, list]]:
         """Make an authenticated request to the GitHub API."""
         url = f"{self.BASE_URL}{endpoint}"
 
@@ -333,7 +333,7 @@ class GitHubClient:
 
         return result.get("data", {})
 
-    def get_project_v2(self, project_number: int) -> dict | None:
+    def get_project_v2(self, project_number: int) -> Optional[dict]:
         """
         Get a GitHub Project v2 by number.
 
@@ -371,7 +371,7 @@ class GitHubClient:
             result = self._graphql_request(query, variables)
             return result.get("user", {}).get("projectV2")
 
-    def get_project_status_field(self, project_id: str) -> dict | None:
+    def get_project_status_field(self, project_id: str) -> Optional[dict]:
         """
         Get the Status field from a GitHub Project v2.
 
@@ -422,7 +422,64 @@ class GitHubClient:
 
         return None
 
-    def add_issue_to_project(self, project_id: str, issue_node_id: str) -> str | None:
+    def create_status_options(
+        self,
+        project_id: str,
+        field_id: str,
+        existing_options: list[dict],
+        new_option_names: list[str]
+    ) -> bool:
+        """
+        Add new status options to a GitHub Project v2 Status field.
+
+        Preserves all existing options and appends new ones.
+        Returns True if successful.
+        """
+        # Build the complete options list (existing + new)
+        all_options = []
+
+        # First, include all existing options
+        for opt in existing_options:
+            all_options.append({
+                "id": opt["id"],
+                "name": opt["name"],
+            })
+
+        # Then add new options (without IDs - GitHub will generate them)
+        for name in new_option_names:
+            all_options.append({
+                "name": name,
+            })
+
+        mutation = """
+        mutation($projectId: ID!, $fieldId: ID!, $options: [ProjectV2SingleSelectFieldOptionInput!]!) {
+            updateProjectV2Field(input: {
+                projectId: $projectId,
+                fieldId: $fieldId,
+                singleSelectOptions: $options
+            }) {
+                projectV2Field {
+                    ... on ProjectV2SingleSelectField {
+                        id
+                        options {
+                            id
+                            name
+                        }
+                    }
+                }
+            }
+        }
+        """
+        variables = {
+            "projectId": project_id,
+            "fieldId": field_id,
+            "options": all_options
+        }
+
+        result = self._graphql_request(mutation, variables)
+        return result.get("updateProjectV2Field", {}).get("projectV2Field") is not None
+
+    def add_issue_to_project(self, project_id: str, issue_node_id: str) -> Optional[str]:
         """
         Add an issue to a GitHub Project v2.
 
@@ -479,7 +536,7 @@ class GitHubClient:
 
         return result.get("updateProjectV2ItemFieldValue", {}).get("projectV2Item") is not None
 
-    def get_issue_node_id(self, repo_name: str, issue_number: int) -> str | None:
+    def get_issue_node_id(self, repo_name: str, issue_number: int) -> Optional[str]:
         """Get the GraphQL node ID for an issue."""
         query = """
         query($owner: String!, $repo: String!, $number: Int!) {
@@ -555,8 +612,9 @@ def init_session_state():
         # GitHub Project mapping
         "project_data": None,  # Project info from GitHub
         "status_field": None,  # Status field info (id, options)
-        "status_mapping": {},  # Trello list name -> GitHub status option ID
+        "status_mapping": {},  # Trello list ID -> mapping info
         "mapping_complete": False,
+        "options_to_create": [],  # Status options that need to be created
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -975,53 +1033,73 @@ def render_status_mapping_step(github_client: GitHubClient, project_number: str)
 
     # Get available status options
     status_options = status_field.get("options", [])
-    option_names = ["(Skip - No Status)"] + [opt["name"] for opt in status_options]
     option_map = {opt["name"]: opt["id"] for opt in status_options}
 
-    # Check for unmatched lists
-    list_names = [clean_title(lst["name"]) for lst in lists]
-    unmatched = [name for name in list_names if name not in option_map]
+    # Identify which lists have matches and which need to be created
+    lists_to_create = []
+    lists_matched = []
 
-    if unmatched:
-        st.warning(
-            f"**{len(unmatched)} Trello lists don't have matching Status options:** "
-            f"{', '.join(unmatched)}"
+    for lst in lists:
+        cleaned_name = clean_title(lst["name"])
+        if cleaned_name in option_map:
+            lists_matched.append(cleaned_name)
+        else:
+            lists_to_create.append(cleaned_name)
+
+    # Show summary
+    if lists_to_create:
+        st.info(
+            f"**{len(lists_to_create)} new Status options will be created:** "
+            f"{', '.join(lists_to_create)}"
         )
 
-    st.write("Map each Trello list to a GitHub Project Status:")
+    if lists_matched:
+        st.write(f"**{len(lists_matched)} lists match existing Status options**")
 
-    # Create mapping UI
+    st.divider()
+    st.write("**Status Mapping Preview:**")
+
+    # Build mapping automatically
     mapping = {}
+    options_to_create = []
 
     for lst in lists:
         list_name = lst["name"]
         cleaned_name = clean_title(list_name)
 
-        # Default selection: match by name if exists, otherwise first option
-        default_idx = 0
-        if cleaned_name in option_map:
-            try:
-                default_idx = option_names.index(cleaned_name)
-            except ValueError:
-                default_idx = 0
+        col1, col2, col3 = st.columns([2, 2, 1])
 
-        col1, col2 = st.columns([1, 2])
         with col1:
             st.write(f"**{list_name}**")
-        with col2:
-            selected = st.selectbox(
-                f"Status for {list_name}",
-                options=option_names,
-                index=default_idx,
-                key=f"status_map_{lst['id']}",
-                label_visibility="collapsed"
-            )
 
-            if selected != "(Skip - No Status)":
+        with col2:
+            if cleaned_name in option_map:
+                st.write(f"→ {cleaned_name}")
                 mapping[lst["id"]] = {
-                    "status_name": selected,
-                    "status_option_id": option_map[selected]
+                    "status_name": cleaned_name,
+                    "status_option_id": option_map[cleaned_name],
+                    "needs_creation": False
                 }
+            else:
+                st.write(f"→ {cleaned_name}")
+                mapping[lst["id"]] = {
+                    "status_name": cleaned_name,
+                    "status_option_id": None,  # Will be set after creation
+                    "needs_creation": True
+                }
+                if cleaned_name not in options_to_create:
+                    options_to_create.append(cleaned_name)
+
+        with col3:
+            if cleaned_name in option_map:
+                st.success("Matched", icon="✓")
+            else:
+                st.warning("Will create", icon="✚")
+
+    # Store options that need to be created
+    st.session_state.options_to_create = options_to_create
+
+    st.divider()
 
     # Save mapping button
     if st.button("Confirm Mapping", type="primary"):
@@ -1090,10 +1168,12 @@ def run_migration(
     """Execute the migration process using GitHub Projects v2."""
     project = st.session_state.project_data
     status_field = st.session_state.status_field
-    status_mapping = st.session_state.status_mapping
+    status_mapping = st.session_state.status_mapping.copy()  # Make a copy to modify
+    options_to_create = st.session_state.get("options_to_create", [])
 
     results = {
         "repo_created": False,
+        "status_options_created": 0,
         "labels_created": 0,
         "issues_created": 0,
         "issues_added_to_project": 0,
@@ -1104,8 +1184,8 @@ def run_migration(
 
     cards = board_data["cards"]
 
-    # Total steps: repo + labels + (issue creation + add to project + set status) per card
-    total_steps = 1 + 1 + (len(cards) * 3)
+    # Total steps: repo + status options + labels + (issue creation + add to project + set status) per card
+    total_steps = 1 + 1 + 1 + (len(cards) * 3)
     current_step = 0
 
     progress_bar = st.progress(0)
@@ -1128,7 +1208,60 @@ def run_migration(
         current_step += 1
         progress_bar.progress(current_step / total_steps)
 
-        # Step 2: Create labels
+        # Step 2: Create new Status options if needed
+        if options_to_create:
+            status_text.write(f"Creating {len(options_to_create)} new Status options...")
+
+            try:
+                existing_options = status_field.get("options", [])
+                success = github_client.create_status_options(
+                    project["id"],
+                    status_field["id"],
+                    existing_options,
+                    options_to_create
+                )
+
+                if success:
+                    results["status_options_created"] = len(options_to_create)
+                    status_text.write(f"Created Status options: {', '.join(options_to_create)}")
+
+                    # Re-query the status field to get the new option IDs
+                    time.sleep(1)  # Brief pause for propagation
+                    updated_status_field = github_client.get_project_status_field(project["id"])
+
+                    if updated_status_field:
+                        st.session_state.status_field = updated_status_field
+                        status_field = updated_status_field
+
+                        # Build new option map with fresh IDs
+                        new_option_map = {
+                            opt["name"]: opt["id"]
+                            for opt in updated_status_field.get("options", [])
+                        }
+
+                        # Update mapping with new option IDs
+                        for list_id, mapping_info in status_mapping.items():
+                            if mapping_info.get("needs_creation"):
+                                status_name = mapping_info["status_name"]
+                                if status_name in new_option_map:
+                                    mapping_info["status_option_id"] = new_option_map[status_name]
+                                    mapping_info["needs_creation"] = False
+                else:
+                    error_msg = "Failed to create Status options"
+                    results["errors"].append(error_msg)
+                    with error_container:
+                        st.error(error_msg)
+
+            except Exception as e:
+                error_msg = f"Error creating Status options: {e}"
+                results["errors"].append(error_msg)
+                with error_container:
+                    st.error(error_msg)
+
+        current_step += 1
+        progress_bar.progress(current_step / total_steps)
+
+        # Step 3: Create labels
         status_text.write("Creating labels...")
 
         existing_labels = github_client.get_labels(repo_name)
@@ -1264,17 +1397,19 @@ def render_results():
         return
 
     # Success metrics
-    col1, col2, col3, col4, col5 = st.columns(5)
+    col1, col2, col3, col4, col5, col6 = st.columns(6)
 
     with col1:
         st.metric("Repository", "Created" if results["repo_created"] else "Existed")
     with col2:
-        st.metric("Issues", results["issues_created"])
+        st.metric("Status Options", results.get("status_options_created", 0))
     with col3:
-        st.metric("Labels", results["labels_created"])
+        st.metric("Issues", results["issues_created"])
     with col4:
-        st.metric("Added to Project", results.get("issues_added_to_project", 0))
+        st.metric("Labels", results["labels_created"])
     with col5:
+        st.metric("In Project", results.get("issues_added_to_project", 0))
+    with col6:
         st.metric("Status Set", results.get("statuses_set", 0))
 
     # Errors
@@ -1303,6 +1438,7 @@ def render_results():
         st.session_state.status_field = None
         st.session_state.status_mapping = {}
         st.session_state.mapping_complete = False
+        st.session_state.options_to_create = []
         st.rerun()
 
 
