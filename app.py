@@ -389,6 +389,8 @@ class GitHubClient:
                                 options {
                                     id
                                     name
+                                    color
+                                    description
                                 }
                             }
                         }
@@ -424,7 +426,6 @@ class GitHubClient:
 
     def create_status_options(
         self,
-        project_id: str,
         field_id: str,
         existing_options: list[dict],
         new_option_names: list[str]
@@ -436,31 +437,35 @@ class GitHubClient:
         Returns True if successful.
         """
         # Build the complete options list (existing + new)
+        # GitHub replaces ALL options with what you pass, so we must include existing ones
         all_options = []
 
-        # First, include all existing options
+        # First, include all existing options with their current properties
         for opt in existing_options:
             all_options.append({
-                "id": opt["id"],
                 "name": opt["name"],
+                "color": opt.get("color", "GRAY"),
+                "description": opt.get("description", ""),
             })
 
-        # Then add new options (without IDs - GitHub will generate them)
+        # Then add new options with default color
         for name in new_option_names:
             all_options.append({
                 "name": name,
+                "color": "GRAY",
+                "description": "",
             })
 
         mutation = """
-        mutation($projectId: ID!, $fieldId: ID!, $options: [ProjectV2SingleSelectFieldOptionInput!]!) {
+        mutation UpdateField($fieldId: ID!, $options: [ProjectV2SingleSelectFieldOptionInput!]!) {
             updateProjectV2Field(input: {
-                projectId: $projectId,
-                fieldId: $fieldId,
+                fieldId: $fieldId
                 singleSelectOptions: $options
             }) {
                 projectV2Field {
                     ... on ProjectV2SingleSelectField {
                         id
+                        name
                         options {
                             id
                             name
@@ -471,7 +476,6 @@ class GitHubClient:
         }
         """
         variables = {
-            "projectId": project_id,
             "fieldId": field_id,
             "options": all_options
         }
@@ -1215,7 +1219,6 @@ def run_migration(
             try:
                 existing_options = status_field.get("options", [])
                 success = github_client.create_status_options(
-                    project["id"],
                     status_field["id"],
                     existing_options,
                     options_to_create
