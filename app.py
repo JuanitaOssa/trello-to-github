@@ -148,9 +148,10 @@ class GitHubClient:
         "": "ededed",
     }
 
-    def __init__(self, token: str, username: str):
+    def __init__(self, token: str, owner: str, is_org: bool = False):
         self.token = token
-        self.username = username
+        self.owner = owner  # username or org name
+        self.is_org = is_org
         self.headers = {
             "Authorization": f"token {token}",
             "Accept": "application/vnd.github.v3+json",
@@ -185,12 +186,17 @@ class GitHubClient:
 
     def repo_exists(self, repo_name: str) -> bool:
         """Check if a repository exists."""
-        result = self._make_request("GET", f"/repos/{self.username}/{repo_name}")
+        result = self._make_request("GET", f"/repos/{self.owner}/{repo_name}")
         return result is not None
 
     def create_repo(self, repo_name: str, description: str = "") -> dict:
-        """Create a new repository."""
-        return self._make_request("POST", "/user/repos", {
+        """Create a new repository under user account or organization."""
+        if self.is_org:
+            endpoint = f"/orgs/{self.owner}/repos"
+        else:
+            endpoint = "/user/repos"
+
+        return self._make_request("POST", endpoint, {
             "name": repo_name,
             "description": description,
             "private": False,
@@ -201,7 +207,7 @@ class GitHubClient:
         """Get all milestones in a repository."""
         result = self._make_request(
             "GET",
-            f"/repos/{self.username}/{repo_name}/milestones",
+            f"/repos/{self.owner}/{repo_name}/milestones",
         )
         return result or []
 
@@ -209,7 +215,7 @@ class GitHubClient:
         """Create a milestone in a repository."""
         return self._make_request(
             "POST",
-            f"/repos/{self.username}/{repo_name}/milestones",
+            f"/repos/{self.owner}/{repo_name}/milestones",
             {"title": title}
         )
 
@@ -217,7 +223,7 @@ class GitHubClient:
         """Get all labels in a repository."""
         result = self._make_request(
             "GET",
-            f"/repos/{self.username}/{repo_name}/labels",
+            f"/repos/{self.owner}/{repo_name}/labels",
         )
         return result or []
 
@@ -225,7 +231,7 @@ class GitHubClient:
         """Create a label in a repository."""
         return self._make_request(
             "POST",
-            f"/repos/{self.username}/{repo_name}/labels",
+            f"/repos/{self.owner}/{repo_name}/labels",
             {"name": name, "color": color}
         )
 
@@ -247,7 +253,7 @@ class GitHubClient:
 
         return self._make_request(
             "POST",
-            f"/repos/{self.username}/{repo_name}/issues",
+            f"/repos/{self.owner}/{repo_name}/issues",
             data
         )
 
@@ -365,10 +371,21 @@ def render_sidebar() -> dict:
             help="GitHub PAT with repo permissions"
         )
 
-        github_username = st.text_input(
-            "Username",
-            key="github_username",
-            help="Your GitHub username"
+        # Account type toggle
+        account_type = st.radio(
+            "Account Type",
+            options=["personal", "organization"],
+            format_func=lambda x: "Personal Account" if x == "personal" else "Organization",
+            key="github_account_type",
+            horizontal=True,
+        )
+
+        is_org = account_type == "organization"
+
+        github_owner = st.text_input(
+            "Organization Name" if is_org else "Username",
+            key="github_owner",
+            help="GitHub organization name" if is_org else "Your GitHub username"
         )
 
         github_repo = st.text_input(
@@ -380,7 +397,7 @@ def render_sidebar() -> dict:
         st.divider()
 
         # Validation status
-        github_ready = all([github_token, github_username, github_repo])
+        github_ready = all([github_token, github_owner, github_repo])
 
         if input_mode == "api":
             trello_ready = all([trello_api_key, trello_token])
@@ -403,8 +420,9 @@ def render_sidebar() -> dict:
             "trello_token": trello_token,
             "uploaded_file": uploaded_file,
             "github_token": github_token,
-            "github_username": github_username,
+            "github_owner": github_owner,
             "github_repo": github_repo,
+            "github_is_org": is_org,
             "trello_ready": trello_ready,
             "github_ready": github_ready,
         }
@@ -619,7 +637,7 @@ def render_migrate_step(
 
     st.write(
         f"Ready to migrate **{board_data['board_name']}** to "
-        f"**{github_client.username}/{repo_name}**"
+        f"**{github_client.owner}/{repo_name}**"
     )
 
     # Migration summary
@@ -654,7 +672,7 @@ def run_migration(
         "labels_created": 0,
         "issues_created": 0,
         "errors": [],
-        "repo_url": f"https://github.com/{github_client.username}/{repo_name}",
+        "repo_url": f"https://github.com/{github_client.owner}/{repo_name}",
     }
 
     lists = board_data["lists"]
@@ -892,7 +910,8 @@ def main():
     # Initialize GitHub client
     github_client = GitHubClient(
         sidebar_config["github_token"],
-        sidebar_config["github_username"]
+        sidebar_config["github_owner"],
+        sidebar_config["github_is_org"]
     )
     github_repo = sidebar_config["github_repo"]
 
