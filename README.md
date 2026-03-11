@@ -1,6 +1,6 @@
 # Trello → GitHub Migrator
 
-A Streamlit web application that migrates Trello boards to GitHub Issues and Milestones. Built as a portfolio project demonstrating API integration, state management, and clean UI design.
+A Streamlit web application that migrates Trello boards to GitHub Issues and Projects. Built as a portfolio project demonstrating REST/GraphQL API integration, state management, and clean UI design.
 
 ## Features
 
@@ -8,37 +8,40 @@ A Streamlit web application that migrates Trello boards to GitHub Issues and Mil
   - **API Mode**: Connect directly to your Trello account and browse all your boards
   - **JSON Upload Mode**: Upload a Trello board export file (no API credentials needed)
 - **Board Preview**: View all lists and cards before migration with an expandable interface
+- **Status Mapping**: Map Trello lists to GitHub Project status fields with a visual interface
 - **Smart Migration**:
   - Creates GitHub repository automatically (if it doesn't exist)
-  - Converts Trello lists → GitHub Milestones
   - Converts Trello cards → GitHub Issues
-  - Maps card descriptions to issue bodies
+  - Adds issues to GitHub Projects v2
+  - Sets Project status based on Trello list (via GraphQL API)
   - Preserves and creates labels with matching colors
   - Links back to original Trello cards
 - **Real-time Progress**: Watch the migration happen with a live progress bar
-- **Error Handling**: Comprehensive error reporting and recovery
+- **Error Handling**: Comprehensive error reporting with real-time display
 
 ## Tech Stack
 
-- **Python 3.10+**
+- **Python 3.9+**
 - **Streamlit** - Web UI framework
 - **Requests** - HTTP client for API calls
-- Direct REST API integration (no external migration libraries)
+- **GitHub REST API** - Repository, issues, and labels
+- **GitHub GraphQL API** - Projects v2 integration
+- Direct API integration (no external migration libraries)
 
 ## Getting Started
 
 ### Prerequisites
 
-- Python 3.10 or higher
+- Python 3.9 or higher
 - A Trello account with at least one board
-- A GitHub account
+- A GitHub account with a Project (Projects v2)
 
 ### Installation
 
 1. **Clone the repository**
 
    ```bash
-   git clone https://github.com/yourusername/trello-to-github.git
+   git clone https://github.com/JuanitaOssa/trello-to-github.git
    cd trello-to-github
    ```
 
@@ -93,18 +96,30 @@ No API credentials needed! Simply export your board as JSON:
 
 > **Note**: Keep both the API Key and Token secure. They provide full access to your Trello account.
 
-### GitHub Personal Access Token
+## GitHub Setup
+
+### Personal Access Token
 
 1. Go to [GitHub Settings → Developer Settings → Personal Access Tokens](https://github.com/settings/tokens)
 2. Click **"Generate new token"** → **"Generate new token (classic)"**
 3. Configure the token:
    - **Note**: "Trello Migration" (or any descriptive name)
    - **Expiration**: Choose based on your needs
-   - **Scopes**: Select `repo` (Full control of private repositories)
+   - **Scopes**: Select these permissions:
+     - `repo` - Full control of private repositories
+     - `read:project` - Read access to projects
+     - `project` - Full control of projects
 4. Click **"Generate token"**
 5. **Copy the token immediately** - you won't be able to see it again!
 
-> **Security Tip**: Use tokens with minimal necessary permissions. The `repo` scope is required to create repositories and issues.
+Or use this direct link: [Generate token with required scopes](https://github.com/settings/tokens/new?scopes=repo,read:project,project)
+
+### GitHub Project Setup
+
+1. Create a GitHub Project (Projects v2) in your account or organization
+2. Add a **Status** field to the project (usually exists by default)
+3. Configure status options to match your Trello lists (e.g., "To Do", "In Progress", "Done")
+4. Note the **Project Number** from the URL (e.g., `18` from `github.com/users/you/projects/18`)
 
 ## How It Works
 
@@ -117,7 +132,7 @@ No API credentials needed! Simply export your board as JSON:
         │                       │                       │
         ▼                       ▼                       ▼
    ┌─────────┐            ┌───────────┐           ┌───────────┐
-   │  Lists  │───────────▶│ Transform │──────────▶│Milestones │
+   │  Lists  │───────────▶│   Map     │──────────▶│  Status   │
    └─────────┘            └───────────┘           └───────────┘
         │                       │                       │
         ▼                       ▼                       ▼
@@ -136,8 +151,8 @@ No API credentials needed! Simply export your board as JSON:
 | Trello | → | GitHub |
 |--------|---|--------|
 | Board | → | Repository |
-| List | → | Milestone |
-| Card | → | Issue |
+| List | → | Project Status |
+| Card | → | Issue (added to Project) |
 | Card Title | → | Issue Title |
 | Card Description | → | Issue Body |
 | Card Labels | → | Issue Labels |
@@ -162,25 +177,40 @@ Trello label colors are automatically mapped to GitHub label colors:
 
 ## Usage
 
-### Using JSON Upload Mode
+### Step 1: Load Trello Data
 
-1. **Select Mode**: Choose "Upload Board JSON" in the sidebar
-2. **Export from Trello**: Follow the instructions to export your board as JSON
-3. **Upload File**: Use the file uploader to select your `.json` file
-4. **Enter GitHub Credentials**: Fill in your GitHub token, username, and repo name
-5. **Parse & Preview**: Click "Parse JSON" to see all lists and cards
-6. **Migrate**: Click "Start Migration" to begin the transfer
-7. **View Results**: Check the summary and click through to your new GitHub repo
+**Using JSON Upload Mode:**
+1. Select "Upload Board JSON" in the sidebar
+2. Export your board from Trello as JSON
+3. Upload the `.json` file
 
-### Using API Mode
+**Using API Mode:**
+1. Select "Connect via Trello API" in the sidebar
+2. Enter your Trello API key and token
+3. Click "Connect to Trello"
+4. Select a board and click "Load Board Data"
 
-1. **Select Mode**: Choose "Connect via Trello API" in the sidebar
-2. **Enter Credentials**: Fill in your Trello API key/token and GitHub credentials
-3. **Connect**: Click "Connect to Trello" to fetch your boards
-4. **Select Board**: Choose a board from the dropdown
-5. **Preview**: Click "Load Board Data" to see all lists and cards
-6. **Migrate**: Click "Start Migration" to begin the transfer
-7. **View Results**: Check the summary and click through to your new GitHub repo
+### Step 2: Configure GitHub
+
+1. Enter your GitHub Personal Access Token
+2. Select account type (Personal or Organization)
+3. Enter your username/org name
+4. Enter the target repository name
+5. Enter the Project Number
+
+### Step 3: Map Status Fields
+
+1. The app fetches your GitHub Project's Status field options
+2. For each Trello list, select the corresponding GitHub Status
+3. Lists are auto-matched by name when possible
+4. Click "Confirm Mapping" to proceed
+
+### Step 4: Migrate
+
+1. Review the migration plan
+2. Click "Start Migration"
+3. Watch real-time progress as issues are created and added to the project
+4. View the results summary with links to your new repo
 
 ## Screenshots
 
@@ -191,6 +221,9 @@ Trello label colors are automatically mapped to GitHub label colors:
 
 ### Board Preview
 ![Board Preview](screenshots/preview.png)
+
+### Status Mapping
+![Status Mapping](screenshots/mapping.png)
 
 ### Migration Progress
 ![Migration Progress](screenshots/progress.png)
@@ -214,7 +247,8 @@ Then edit `.env` with your credentials. The app will still allow manual input fo
 - **Attachments**: Trello card attachments are not migrated (linked in issue body as text only)
 - **Comments**: Trello card comments are not migrated
 - **Checklists**: Trello checklists are not migrated (consider using GitHub task lists in the future)
-- **Due Dates**: Trello due dates are not mapped to GitHub milestones
+- **Due Dates**: Trello due dates are not mapped
+- **Project Required**: You must have an existing GitHub Project with a Status field
 
 ## Contributing
 
@@ -229,3 +263,4 @@ This project is open source and available under the [MIT License](LICENSE).
 - Built with [Streamlit](https://streamlit.io/)
 - Uses the [Trello REST API](https://developer.atlassian.com/cloud/trello/rest/)
 - Uses the [GitHub REST API](https://docs.github.com/en/rest)
+- Uses the [GitHub GraphQL API](https://docs.github.com/en/graphql) for Projects v2
