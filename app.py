@@ -10,6 +10,61 @@ import requests
 from typing import Optional, Union
 import time
 import json
+import re
+import unicodedata
+
+
+# =============================================================================
+# HELPERS
+# =============================================================================
+
+def clean_title(title: str) -> str:
+    """
+    Clean a title string for use in GitHub API calls.
+
+    - Strips leading/trailing whitespace
+    - Removes zero-width and invisible unicode characters
+    - Keeps standard emojis intact
+    """
+    if not title:
+        return title
+
+    # Strip whitespace
+    title = title.strip()
+
+    # Remove zero-width and invisible characters
+    # These include: zero-width space, zero-width non-joiner, zero-width joiner,
+    # left-to-right mark, right-to-left mark, and other format characters
+    invisible_chars = re.compile(
+        r'[\u200b\u200c\u200d\u200e\u200f'  # Zero-width chars and direction marks
+        r'\u2060\u2061\u2062\u2063\u2064'    # Word joiner, invisible operators
+        r'\ufeff'                            # Byte order mark
+        r'\u00ad'                            # Soft hyphen
+        r'\u034f'                            # Combining grapheme joiner
+        r'\u061c'                            # Arabic letter mark
+        r'\u115f\u1160'                      # Hangul fillers
+        r'\u17b4\u17b5'                      # Khmer vowel inherent
+        r'\u180b-\u180e'                     # Mongolian free variation selectors
+        r'\uffa0'                            # Halfwidth Hangul filler
+        r'\ufff0-\ufff8'                     # Specials
+        r']'
+    )
+    title = invisible_chars.sub('', title)
+
+    # Normalize unicode to NFC form (composed characters)
+    title = unicodedata.normalize('NFC', title)
+
+    # Remove any remaining control characters (but keep emojis)
+    # Control chars are in categories Cc and Cf, but we want to keep some Cf for emojis
+    cleaned = []
+    for char in title:
+        category = unicodedata.category(char)
+        # Keep everything except control characters (Cc)
+        # and format characters (Cf) that aren't emoji-related
+        if category != 'Cc' and (category != 'Cf' or ord(char) > 0xFFFF):
+            cleaned.append(char)
+
+    return ''.join(cleaned).strip()
 
 
 # =============================================================================
@@ -151,7 +206,8 @@ class GitHubClient:
     def __init__(self, token: str, owner: str, is_org: bool = False):
         self.token = token
         self.owner = owner  # username or org name
-        self.is_org = is_org
+        self._is_org_override = is_org  # User's explicit choice
+        self._authenticated_user = None  # Cached authenticated user login
         self.headers = {
             "Authorization": f"token {token}",
             "Accept": "application/vnd.github.v3+json",
@@ -177,12 +233,51 @@ class GitHubClient:
         if response.status_code == 404:
             return None
 
-        response.raise_for_status()
+        # For non-success status codes, try to extract error message
+        if not response.ok:
+            try:
+                error_data = response.json()
+                error_msg = error_data.get("message", response.text)
+                errors = error_data.get("errors", [])
+                if errors:
+                    error_details = "; ".join(
+                        e.get("message", str(e)) for e in errors
+                    )
+                    error_msg = f"{error_msg} ({error_details})"
+            except Exception:
+                error_msg = response.text
+
+            raise requests.exceptions.HTTPError(
+                f"GitHub API error {response.status_code}: {error_msg}",
+                response=response
+            )
 
         if response.status_code == 204:
             return {}
 
         return response.json()
+
+    def get_authenticated_user(self) -> str:
+        """Get the login name of the authenticated user."""
+        if self._authenticated_user is None:
+            result = self._make_request("GET", "/user")
+            self._authenticated_user = result.get("login", "") if result else ""
+        return self._authenticated_user
+
+    def is_org(self) -> bool:
+        """
+        Determine if the owner is an organization.
+
+        Returns True if:
+        - User explicitly selected Organization mode, OR
+        - The owner doesn't match the authenticated user's login
+        """
+        if self._is_org_override:
+            return True
+
+        # Auto-detect: if owner != authenticated user, treat as org
+        auth_user = self.get_authenticated_user()
+        return auth_user.lower() != self.owner.lower()
 
     def repo_exists(self, repo_name: str) -> bool:
         """Check if a repository exists."""
@@ -191,7 +286,7 @@ class GitHubClient:
 
     def create_repo(self, repo_name: str, description: str = "") -> dict:
         """Create a new repository under user account or organization."""
-        if self.is_org:
+        if self.is_org():
             endpoint = f"/orgs/{self.owner}/repos"
         else:
             endpoint = "/user/repos"
@@ -211,12 +306,18 @@ class GitHubClient:
         )
         return result or []
 
-    def create_milestone(self, repo_name: str, title: str) -> dict:
+    def create_milestone(self, repo_name: str, title: str, description: str = "") -> dict:
         """Create a milestone in a repository."""
+        cleaned_title = clean_title(title)
+
+        payload = {"title": cleaned_title}
+        if description:
+            payload["description"] = description
+
         return self._make_request(
             "POST",
             f"/repos/{self.owner}/{repo_name}/milestones",
-            {"title": title}
+            payload
         )
 
     def get_labels(self, repo_name: str) -> list[dict]:
@@ -244,7 +345,9 @@ class GitHubClient:
         labels: Optional[list[str]] = None
     ) -> dict:
         """Create an issue in a repository."""
-        data = {"title": title, "body": body}
+        cleaned_title = clean_title(title)
+
+        data = {"title": cleaned_title, "body": body}
 
         if milestone:
             data["milestone"] = milestone
@@ -701,31 +804,45 @@ def run_migration(
         current_step += 1
         progress_bar.progress(current_step / total_steps)
 
-        # Step 2: Create milestones
+        # Step 2: Create milestones (BEFORE issues so we can assign issues to them)
         status_text.write("Creating milestones...")
 
         existing_milestones = github_client.get_milestones(repo_name)
+        # Map cleaned titles to milestone numbers for comparison
         existing_milestone_names = {m["title"]: m["number"] for m in existing_milestones}
 
         milestone_map = {}  # list_id -> milestone_number
+        error_container = st.container()  # Container for real-time error display
 
         for lst in lists:
             list_name = lst["name"]
             list_id = lst["id"]
+            cleaned_name = clean_title(list_name)
 
-            if list_name in existing_milestone_names:
-                milestone_map[list_id] = existing_milestone_names[list_name]
+            # Check if milestone already exists (compare cleaned names)
+            if cleaned_name in existing_milestone_names:
+                milestone_map[list_id] = existing_milestone_names[cleaned_name]
+                status_text.write(f"Milestone exists: {cleaned_name}")
             else:
                 try:
                     milestone = github_client.create_milestone(repo_name, list_name)
-                    milestone_map[list_id] = milestone["number"]
-                    results["milestones_created"] += 1
+                    if milestone and "number" in milestone:
+                        milestone_map[list_id] = milestone["number"]
+                        results["milestones_created"] += 1
+                        status_text.write(f"Created milestone: {cleaned_name}")
+                    else:
+                        error_msg = f"Milestone '{cleaned_name}' created but no number returned"
+                        results["errors"].append(error_msg)
+                        with error_container:
+                            st.warning(error_msg)
                 except Exception as e:
-                    results["errors"].append(f"Failed to create milestone '{list_name}': {e}")
+                    error_msg = f"Failed to create milestone '{cleaned_name}': {e}"
+                    results["errors"].append(error_msg)
+                    with error_container:
+                        st.error(error_msg)
 
             current_step += 1
             progress_bar.progress(current_step / total_steps)
-            status_text.write(f"Created milestone: {list_name}")
 
         # Step 3: Create labels
         status_text.write("Creating labels...")
@@ -746,13 +863,17 @@ def run_migration(
                     github_client.create_label(repo_name, label_name, color)
                     results["labels_created"] += 1
                 except Exception as e:
-                    results["errors"].append(f"Failed to create label '{label_name}': {e}")
+                    error_msg = f"Failed to create label '{label_name}': {e}"
+                    results["errors"].append(error_msg)
+                    with error_container:
+                        st.error(error_msg)
 
         # Step 4: Create issues
         status_text.write("Creating issues...")
 
         for card in cards:
             card_name = card["name"]
+            cleaned_card_name = clean_title(card_name)
             card_desc = card.get("desc", "")
             list_id = card["idList"]
             card_labels = [l["name"] for l in card.get("labels", []) if l.get("name")]
@@ -767,18 +888,21 @@ def run_migration(
             try:
                 github_client.create_issue(
                     repo_name,
-                    card_name,
+                    card_name,  # clean_title is called inside create_issue
                     body,
                     milestone=milestone_number,
                     labels=card_labels if card_labels else None
                 )
                 results["issues_created"] += 1
+                status_text.write(f"Created issue: {cleaned_card_name}")
             except Exception as e:
-                results["errors"].append(f"Failed to create issue '{card_name}': {e}")
+                error_msg = f"Failed to create issue '{cleaned_card_name}': {e}"
+                results["errors"].append(error_msg)
+                with error_container:
+                    st.error(error_msg)
 
             current_step += 1
             progress_bar.progress(current_step / total_steps)
-            status_text.write(f"Created issue: {card_name}")
 
             # Small delay to avoid rate limiting
             time.sleep(0.5)
