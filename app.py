@@ -1,6 +1,6 @@
 """
 Trello → GitHub Migrator
-A Streamlit app to migrate Trello boards to GitHub Issues and Milestones.
+A Streamlit app to migrate Trello boards to GitHub Issues and Projects.
 """
 
 from __future__ import annotations
@@ -298,27 +298,203 @@ class GitHubClient:
             "has_issues": True,
         })
 
-    def get_milestones(self, repo_name: str) -> list[dict]:
-        """Get all milestones in a repository."""
-        result = self._make_request(
-            "GET",
-            f"/repos/{self.owner}/{repo_name}/milestones",
+    # =========================================================================
+    # GitHub Projects v2 (GraphQL API)
+    # =========================================================================
+
+    def _graphql_request(self, query: str, variables: Optional[dict] = None) -> dict:
+        """Make a GraphQL request to GitHub's API."""
+        url = "https://api.github.com/graphql"
+
+        payload = {"query": query}
+        if variables:
+            payload["variables"] = variables
+
+        response = requests.post(
+            url,
+            headers=self.headers,
+            json=payload,
+            timeout=30
         )
-        return result or []
 
-    def create_milestone(self, repo_name: str, title: str, description: str = "") -> dict:
-        """Create a milestone in a repository."""
-        cleaned_title = clean_title(title)
+        if not response.ok:
+            raise requests.exceptions.HTTPError(
+                f"GitHub GraphQL error {response.status_code}: {response.text}",
+                response=response
+            )
 
-        payload = {"title": cleaned_title}
-        if description:
-            payload["description"] = description
+        result = response.json()
 
-        return self._make_request(
-            "POST",
-            f"/repos/{self.owner}/{repo_name}/milestones",
-            payload
-        )
+        if "errors" in result:
+            error_msgs = [e.get("message", str(e)) for e in result["errors"]]
+            raise requests.exceptions.HTTPError(
+                f"GitHub GraphQL error: {'; '.join(error_msgs)}"
+            )
+
+        return result.get("data", {})
+
+    def get_project_v2(self, project_number: int) -> dict | None:
+        """
+        Get a GitHub Project v2 by number.
+
+        Returns project info including ID, title, and fields.
+        """
+        # Query differs based on whether owner is org or user
+        if self.is_org():
+            query = """
+            query($owner: String!, $number: Int!) {
+                organization(login: $owner) {
+                    projectV2(number: $number) {
+                        id
+                        title
+                        number
+                    }
+                }
+            }
+            """
+            variables = {"owner": self.owner, "number": project_number}
+            result = self._graphql_request(query, variables)
+            return result.get("organization", {}).get("projectV2")
+        else:
+            query = """
+            query($owner: String!, $number: Int!) {
+                user(login: $owner) {
+                    projectV2(number: $number) {
+                        id
+                        title
+                        number
+                    }
+                }
+            }
+            """
+            variables = {"owner": self.owner, "number": project_number}
+            result = self._graphql_request(query, variables)
+            return result.get("user", {}).get("projectV2")
+
+    def get_project_status_field(self, project_id: str) -> dict | None:
+        """
+        Get the Status field from a GitHub Project v2.
+
+        Returns the field ID and all available status options.
+        """
+        query = """
+        query($projectId: ID!) {
+            node(id: $projectId) {
+                ... on ProjectV2 {
+                    fields(first: 50) {
+                        nodes {
+                            ... on ProjectV2SingleSelectField {
+                                id
+                                name
+                                options {
+                                    id
+                                    name
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        """
+        variables = {"projectId": project_id}
+        result = self._graphql_request(query, variables)
+
+        fields = result.get("node", {}).get("fields", {}).get("nodes", [])
+
+        # Find the Status field (usually named "Status")
+        for field in fields:
+            if field and field.get("name") == "Status":
+                return {
+                    "id": field["id"],
+                    "name": field["name"],
+                    "options": field.get("options", [])
+                }
+
+        # If no "Status" field found, return the first single-select field
+        for field in fields:
+            if field and "options" in field:
+                return {
+                    "id": field["id"],
+                    "name": field.get("name", "Unknown"),
+                    "options": field.get("options", [])
+                }
+
+        return None
+
+    def add_issue_to_project(self, project_id: str, issue_node_id: str) -> str | None:
+        """
+        Add an issue to a GitHub Project v2.
+
+        Returns the project item ID if successful.
+        """
+        mutation = """
+        mutation($projectId: ID!, $contentId: ID!) {
+            addProjectV2ItemById(input: {projectId: $projectId, contentId: $contentId}) {
+                item {
+                    id
+                }
+            }
+        }
+        """
+        variables = {"projectId": project_id, "contentId": issue_node_id}
+        result = self._graphql_request(mutation, variables)
+
+        item = result.get("addProjectV2ItemById", {}).get("item")
+        return item.get("id") if item else None
+
+    def set_project_item_status(
+        self,
+        project_id: str,
+        item_id: str,
+        status_field_id: str,
+        status_option_id: str
+    ) -> bool:
+        """
+        Set the status field value for a project item.
+
+        Returns True if successful.
+        """
+        mutation = """
+        mutation($projectId: ID!, $itemId: ID!, $fieldId: ID!, $optionId: String!) {
+            updateProjectV2ItemFieldValue(input: {
+                projectId: $projectId,
+                itemId: $itemId,
+                fieldId: $fieldId,
+                value: {singleSelectOptionId: $optionId}
+            }) {
+                projectV2Item {
+                    id
+                }
+            }
+        }
+        """
+        variables = {
+            "projectId": project_id,
+            "itemId": item_id,
+            "fieldId": status_field_id,
+            "optionId": status_option_id
+        }
+        result = self._graphql_request(mutation, variables)
+
+        return result.get("updateProjectV2ItemFieldValue", {}).get("projectV2Item") is not None
+
+    def get_issue_node_id(self, repo_name: str, issue_number: int) -> str | None:
+        """Get the GraphQL node ID for an issue."""
+        query = """
+        query($owner: String!, $repo: String!, $number: Int!) {
+            repository(owner: $owner, name: $repo) {
+                issue(number: $number) {
+                    id
+                }
+            }
+        }
+        """
+        variables = {"owner": self.owner, "repo": repo_name, "number": issue_number}
+        result = self._graphql_request(query, variables)
+
+        issue = result.get("repository", {}).get("issue")
+        return issue.get("id") if issue else None
 
     def get_labels(self, repo_name: str) -> list[dict]:
         """Get all labels in a repository."""
@@ -376,6 +552,11 @@ def init_session_state():
         "migration_results": None,
         "input_mode": "api",  # "api" or "json"
         "json_loaded": False,
+        # GitHub Project mapping
+        "project_data": None,  # Project info from GitHub
+        "status_field": None,  # Status field info (id, options)
+        "status_mapping": {},  # Trello list name -> GitHub status option ID
+        "mapping_complete": False,
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -461,17 +642,23 @@ def render_sidebar() -> dict:
 
         # GitHub credentials (always shown)
         st.subheader("GitHub")
-        st.caption(
-            "Generate a token at "
-            "[GitHub Settings](https://github.com/settings/tokens) "
-            "with `repo` scope"
-        )
+
+        # PAT scope warning
+        with st.expander("Required token scopes", expanded=False):
+            st.markdown("""
+            Your GitHub token needs these scopes:
+            - `repo` - Full control of repositories
+            - `read:project` - Read project boards
+            - `project` - Full control of projects
+
+            [Generate token](https://github.com/settings/tokens/new?scopes=repo,read:project,project)
+            """)
 
         github_token = st.text_input(
             "Personal Access Token",
             type="password",
             key="github_token",
-            help="GitHub PAT with repo permissions"
+            help="GitHub PAT with repo and project permissions"
         )
 
         # Account type toggle
@@ -497,10 +684,16 @@ def render_sidebar() -> dict:
             help="Target repository name (will be created if it doesn't exist)"
         )
 
+        github_project_number = st.text_input(
+            "Project Number",
+            key="github_project_number",
+            help="The number from your project URL (e.g., 18 from /projects/18)"
+        )
+
         st.divider()
 
         # Validation status
-        github_ready = all([github_token, github_owner, github_repo])
+        github_ready = all([github_token, github_owner, github_repo, github_project_number])
 
         if input_mode == "api":
             trello_ready = all([trello_api_key, trello_token])
@@ -525,6 +718,7 @@ def render_sidebar() -> dict:
             "github_token": github_token,
             "github_owner": github_owner,
             "github_repo": github_repo,
+            "github_project_number": github_project_number,
             "github_is_org": is_org,
             "trello_ready": trello_ready,
             "github_ready": github_ready,
@@ -679,7 +873,7 @@ def render_board_preview(board_data: dict):
     # Summary metrics
     col1, col2, col3 = st.columns(3)
     with col1:
-        st.metric("Lists (→ Milestones)", len(lists))
+        st.metric("Lists (→ Status)", len(lists))
     with col2:
         st.metric("Cards (→ Issues)", len(cards))
     with col3:
@@ -722,12 +916,129 @@ def render_board_preview(board_data: dict):
                 st.caption("No cards in this list")
 
 
+def render_status_mapping_step(github_client: GitHubClient, project_number: str):
+    """Render the status field mapping step."""
+    st.header("Step 2: Map Lists to Project Status")
+
+    if not st.session_state.board_data:
+        st.info("Please load a Trello board first.")
+        return False
+
+    if not project_number:
+        st.warning("Please enter a GitHub Project Number in the sidebar.")
+        return False
+
+    board_data = st.session_state.board_data
+    lists = board_data["lists"]
+
+    # Fetch project data if not already loaded
+    if not st.session_state.project_data:
+        with st.spinner("Fetching GitHub Project..."):
+            try:
+                project_num = int(project_number)
+                project = github_client.get_project_v2(project_num)
+
+                if not project:
+                    st.error(
+                        f"Project #{project_number} not found. "
+                        "Make sure the project exists and your token has project access."
+                    )
+                    return False
+
+                st.session_state.project_data = project
+
+                # Get status field
+                status_field = github_client.get_project_status_field(project["id"])
+                if not status_field:
+                    st.error(
+                        "No Status field found in the project. "
+                        "Please add a Status field to your GitHub Project."
+                    )
+                    return False
+
+                st.session_state.status_field = status_field
+
+            except ValueError:
+                st.error("Project number must be a number.")
+                return False
+            except Exception as e:
+                st.error(f"Error fetching project: {e}")
+                return False
+
+    project = st.session_state.project_data
+    status_field = st.session_state.status_field
+
+    if not project or not status_field:
+        return False
+
+    st.success(f"Connected to project: **{project['title']}**")
+
+    # Get available status options
+    status_options = status_field.get("options", [])
+    option_names = ["(Skip - No Status)"] + [opt["name"] for opt in status_options]
+    option_map = {opt["name"]: opt["id"] for opt in status_options}
+
+    # Check for unmatched lists
+    list_names = [clean_title(lst["name"]) for lst in lists]
+    unmatched = [name for name in list_names if name not in option_map]
+
+    if unmatched:
+        st.warning(
+            f"**{len(unmatched)} Trello lists don't have matching Status options:** "
+            f"{', '.join(unmatched)}"
+        )
+
+    st.write("Map each Trello list to a GitHub Project Status:")
+
+    # Create mapping UI
+    mapping = {}
+
+    for lst in lists:
+        list_name = lst["name"]
+        cleaned_name = clean_title(list_name)
+
+        # Default selection: match by name if exists, otherwise first option
+        default_idx = 0
+        if cleaned_name in option_map:
+            try:
+                default_idx = option_names.index(cleaned_name)
+            except ValueError:
+                default_idx = 0
+
+        col1, col2 = st.columns([1, 2])
+        with col1:
+            st.write(f"**{list_name}**")
+        with col2:
+            selected = st.selectbox(
+                f"Status for {list_name}",
+                options=option_names,
+                index=default_idx,
+                key=f"status_map_{lst['id']}",
+                label_visibility="collapsed"
+            )
+
+            if selected != "(Skip - No Status)":
+                mapping[lst["id"]] = {
+                    "status_name": selected,
+                    "status_option_id": option_map[selected]
+                }
+
+    # Save mapping button
+    if st.button("Confirm Mapping", type="primary"):
+        st.session_state.status_mapping = mapping
+        st.session_state.mapping_complete = True
+        st.rerun()
+
+    return st.session_state.mapping_complete
+
+
 def render_migrate_step(
     github_client: GitHubClient,
-    repo_name: str
+    repo_name: str,
+    project_number: str
 ):
     """Render the migration step."""
-    st.header("Step 2: Migrate to GitHub")
+    st.header("Step 3: Migrate to GitHub")
 
     if not st.session_state.board_data:
         if st.session_state.input_mode == "api":
@@ -736,7 +1047,12 @@ def render_migrate_step(
             st.info("Please upload and parse a Trello board JSON file first.")
         return
 
+    if not st.session_state.mapping_complete:
+        st.info("Please complete the status mapping in Step 2 first.")
+        return
+
     board_data = st.session_state.board_data
+    project = st.session_state.project_data
 
     st.write(
         f"Ready to migrate **{board_data['board_name']}** to "
@@ -744,11 +1060,14 @@ def render_migrate_step(
     )
 
     # Migration summary
+    mapped_count = len(st.session_state.status_mapping)
+
     with st.container(border=True):
         st.write("**Migration plan:**")
         st.write(f"- Create repository `{repo_name}` (if it doesn't exist)")
-        st.write(f"- Create {len(board_data['lists'])} milestones")
         st.write(f"- Create {len(board_data['cards'])} issues")
+        st.write(f"- Add issues to project: **{project['title']}**")
+        st.write(f"- Set status for {mapped_count} list mappings")
 
     col1, col2 = st.columns([1, 3])
 
@@ -768,25 +1087,30 @@ def run_migration(
     repo_name: str,
     board_data: dict
 ):
-    """Execute the migration process."""
+    """Execute the migration process using GitHub Projects v2."""
+    project = st.session_state.project_data
+    status_field = st.session_state.status_field
+    status_mapping = st.session_state.status_mapping
+
     results = {
         "repo_created": False,
-        "milestones_created": 0,
         "labels_created": 0,
         "issues_created": 0,
+        "issues_added_to_project": 0,
+        "statuses_set": 0,
         "errors": [],
         "repo_url": f"https://github.com/{github_client.owner}/{repo_name}",
     }
 
-    lists = board_data["lists"]
     cards = board_data["cards"]
-    list_map = board_data["list_map"]
 
-    total_steps = 1 + len(lists) + len(cards)  # repo + milestones + issues
+    # Total steps: repo + labels + (issue creation + add to project + set status) per card
+    total_steps = 1 + 1 + (len(cards) * 3)
     current_step = 0
 
     progress_bar = st.progress(0)
     status_text = st.empty()
+    error_container = st.container()
 
     try:
         # Step 1: Create or verify repository
@@ -799,56 +1123,16 @@ def run_migration(
                 f"Migrated from Trello board: {board_data['board_name']}"
             )
             results["repo_created"] = True
-            time.sleep(1)  # Brief pause for repo creation to propagate
+            time.sleep(2)  # Brief pause for repo creation to propagate
 
         current_step += 1
         progress_bar.progress(current_step / total_steps)
 
-        # Step 2: Create milestones (BEFORE issues so we can assign issues to them)
-        status_text.write("Creating milestones...")
-
-        existing_milestones = github_client.get_milestones(repo_name)
-        # Map cleaned titles to milestone numbers for comparison
-        existing_milestone_names = {m["title"]: m["number"] for m in existing_milestones}
-
-        milestone_map = {}  # list_id -> milestone_number
-        error_container = st.container()  # Container for real-time error display
-
-        for lst in lists:
-            list_name = lst["name"]
-            list_id = lst["id"]
-            cleaned_name = clean_title(list_name)
-
-            # Check if milestone already exists (compare cleaned names)
-            if cleaned_name in existing_milestone_names:
-                milestone_map[list_id] = existing_milestone_names[cleaned_name]
-                status_text.write(f"Milestone exists: {cleaned_name}")
-            else:
-                try:
-                    milestone = github_client.create_milestone(repo_name, list_name)
-                    if milestone and "number" in milestone:
-                        milestone_map[list_id] = milestone["number"]
-                        results["milestones_created"] += 1
-                        status_text.write(f"Created milestone: {cleaned_name}")
-                    else:
-                        error_msg = f"Milestone '{cleaned_name}' created but no number returned"
-                        results["errors"].append(error_msg)
-                        with error_container:
-                            st.warning(error_msg)
-                except Exception as e:
-                    error_msg = f"Failed to create milestone '{cleaned_name}': {e}"
-                    results["errors"].append(error_msg)
-                    with error_container:
-                        st.error(error_msg)
-
-            current_step += 1
-            progress_bar.progress(current_step / total_steps)
-
-        # Step 3: Create labels
+        # Step 2: Create labels
         status_text.write("Creating labels...")
 
         existing_labels = github_client.get_labels(repo_name)
-        existing_label_names = {l["name"].lower() for l in existing_labels}
+        existing_label_names = {l["name"].lower() for l in existing_labels} if existing_labels else set()
 
         unique_labels = {}
         for card in cards:
@@ -868,8 +1152,11 @@ def run_migration(
                     with error_container:
                         st.error(error_msg)
 
-        # Step 4: Create issues
-        status_text.write("Creating issues...")
+        current_step += 1
+        progress_bar.progress(current_step / total_steps)
+
+        # Step 3: Create issues and add to project
+        status_text.write("Creating issues and adding to project...")
 
         for card in cards:
             card_name = card["name"]
@@ -883,18 +1170,21 @@ def run_migration(
             if card.get("url"):
                 body += f"\n\n---\n*Migrated from Trello: {card['url']}*"
 
-            milestone_number = milestone_map.get(list_id)
+            issue_number = None
+            issue_node_id = None
 
+            # 3a: Create the issue
             try:
-                github_client.create_issue(
+                issue = github_client.create_issue(
                     repo_name,
-                    card_name,  # clean_title is called inside create_issue
+                    card_name,
                     body,
-                    milestone=milestone_number,
                     labels=card_labels if card_labels else None
                 )
-                results["issues_created"] += 1
-                status_text.write(f"Created issue: {cleaned_card_name}")
+                if issue and "number" in issue:
+                    issue_number = issue["number"]
+                    results["issues_created"] += 1
+                    status_text.write(f"Created issue #{issue_number}: {cleaned_card_name}")
             except Exception as e:
                 error_msg = f"Failed to create issue '{cleaned_card_name}': {e}"
                 results["errors"].append(error_msg)
@@ -903,6 +1193,51 @@ def run_migration(
 
             current_step += 1
             progress_bar.progress(current_step / total_steps)
+
+            # 3b: Add issue to project
+            if issue_number:
+                try:
+                    # Get the issue's node ID for GraphQL
+                    issue_node_id = github_client.get_issue_node_id(repo_name, issue_number)
+
+                    if issue_node_id:
+                        project_item_id = github_client.add_issue_to_project(
+                            project["id"],
+                            issue_node_id
+                        )
+                        if project_item_id:
+                            results["issues_added_to_project"] += 1
+                            status_text.write(f"Added issue #{issue_number} to project")
+
+                            # 3c: Set status field
+                            if list_id in status_mapping:
+                                mapping = status_mapping[list_id]
+                                try:
+                                    success = github_client.set_project_item_status(
+                                        project["id"],
+                                        project_item_id,
+                                        status_field["id"],
+                                        mapping["status_option_id"]
+                                    )
+                                    if success:
+                                        results["statuses_set"] += 1
+                                        status_text.write(
+                                            f"Set status to '{mapping['status_name']}' for issue #{issue_number}"
+                                        )
+                                except Exception as e:
+                                    error_msg = f"Failed to set status for issue #{issue_number}: {e}"
+                                    results["errors"].append(error_msg)
+                                    with error_container:
+                                        st.warning(error_msg)
+
+                except Exception as e:
+                    error_msg = f"Failed to add issue #{issue_number} to project: {e}"
+                    results["errors"].append(error_msg)
+                    with error_container:
+                        st.warning(error_msg)
+
+            current_step += 2  # Count both project add and status set steps
+            progress_bar.progress(min(current_step / total_steps, 1.0))
 
             # Small delay to avoid rate limiting
             time.sleep(0.5)
@@ -929,16 +1264,18 @@ def render_results():
         return
 
     # Success metrics
-    col1, col2, col3, col4 = st.columns(4)
+    col1, col2, col3, col4, col5 = st.columns(5)
 
     with col1:
         st.metric("Repository", "Created" if results["repo_created"] else "Existed")
     with col2:
-        st.metric("Milestones", results["milestones_created"])
+        st.metric("Issues", results["issues_created"])
     with col3:
         st.metric("Labels", results["labels_created"])
     with col4:
-        st.metric("Issues", results["issues_created"])
+        st.metric("Added to Project", results.get("issues_added_to_project", 0))
+    with col5:
+        st.metric("Status Set", results.get("statuses_set", 0))
 
     # Errors
     if results["errors"]:
@@ -962,6 +1299,10 @@ def render_results():
         st.session_state.migration_complete = False
         st.session_state.migration_results = None
         st.session_state.json_loaded = False
+        st.session_state.project_data = None
+        st.session_state.status_field = None
+        st.session_state.status_mapping = {}
+        st.session_state.mapping_complete = False
         st.rerun()
 
 
@@ -979,7 +1320,7 @@ def main():
     # Header
     st.title("Trello → GitHub Migrator")
     st.caption(
-        "Migrate your Trello boards to GitHub Issues and Milestones with ease."
+        "Migrate your Trello boards to GitHub Issues and Projects with ease."
     )
 
     st.divider()
@@ -1004,13 +1345,17 @@ def main():
             1. Go to [GitHub Settings → Developer Settings → Personal Access Tokens](https://github.com/settings/tokens)
             2. Click "Generate new token (classic)"
             3. Give it a descriptive name
-            4. Select the `repo` scope (full control of private repositories)
+            4. Select these scopes:
+               - `repo` - Full control of repositories
+               - `read:project` - Read project boards
+               - `project` - Full control of projects
             5. Click "Generate token" and copy it immediately
 
-            ### GitHub Username & Repository
+            ### GitHub Username, Repository & Project
 
             - **Username**: Your GitHub username (e.g., `octocat`)
             - **Repository Name**: The name for the new repo (will be created if it doesn't exist)
+            - **Project Number**: The number from your project URL (e.g., `18` from `/projects/18`)
             """)
         return
 
@@ -1038,6 +1383,7 @@ def main():
         sidebar_config["github_is_org"]
     )
     github_repo = sidebar_config["github_repo"]
+    github_project_number = sidebar_config["github_project_number"]
 
     # Show results if migration is complete
     if st.session_state.migration_complete:
@@ -1045,6 +1391,7 @@ def main():
         return
 
     # Main workflow based on input mode
+    # Step 1: Connect to Trello / Load JSON
     if input_mode == "api":
         trello_client = TrelloClient(
             sidebar_config["trello_api_key"],
@@ -1056,7 +1403,14 @@ def main():
 
     st.divider()
 
-    render_migrate_step(github_client, github_repo)
+    # Step 2: Map Trello lists to GitHub Project Status
+    if st.session_state.board_data:
+        render_status_mapping_step(github_client, github_project_number)
+
+        st.divider()
+
+    # Step 3: Migrate
+    render_migrate_step(github_client, github_repo, github_project_number)
 
 
 if __name__ == "__main__":
